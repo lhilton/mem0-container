@@ -16,6 +16,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      APP_DB_NAME: ${APP_DB_NAME:-mem0_app}
     volumes:
       - postgres_db:/var/lib/postgresql/data
       - ./init/init-db.sh:/docker-entrypoint-initdb.d/01-init-db.sh:ro
@@ -36,6 +37,8 @@ services:
       postgres:
         condition: service_healthy
     env_file: .env
+    environment:
+      APP_DB_NAME: ${APP_DB_NAME:-mem0_app}
     command: sh -c "alembic upgrade head"
     restart: "no"
     networks:
@@ -46,6 +49,8 @@ services:
     ports:
       - "8888:8000"
     env_file: .env
+    environment:
+      APP_DB_NAME: ${APP_DB_NAME:-mem0_app}
     depends_on:
       alembic-migrate:
         condition: service_completed_successfully
@@ -88,4 +93,5 @@ volumes:
 
 networks:
   mem0_network:
+    name: ${MEM0_NETWORK_NAME:-mem0_network}
     driver: bridge

@@ -48,6 +48,7 @@ jobs:
       changed: ${{ steps.resolve.outputs.changed }}
       tag: ${{ steps.resolve.outputs.tag }}
       sha: ${{ steps.resolve.outputs.sha }}
+      should_promote: ${{ steps.resolve.outputs.should_promote }}
     steps:
       - name: Checkout this repo
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -64,6 +65,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+
+          # This workflow signs and verifies with the main-branch OIDC
+          # identity, so fail before any build/push when dispatched elsewhere.
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::This workflow may only publish from refs/heads/main (got $GITHUB_REF)"
+            exit 1
+          fi
 
           # --- Validate tag input format (only if supplied) ---
           if [ -n "$TAG_INPUT" ]; then
@@ -109,29 +117,37 @@ jobs:
 
           # --- Decide if anything changed (or force was requested) ---
           PINNED=$(cat .upstream-release 2>/dev/null || echo none)
-          if [ "$FORCE_INPUT" = "true" ] || [ "$PINNED" != "$TAG" ]; then
+          if [ "$FORCE_INPUT" = "true" ] || [ -n "$TAG_INPUT" ] || [ "$PINNED" != "$TAG" ]; then
             CHANGED=true
           else
             CHANGED=false
+          fi
+          if [ -z "$TAG_INPUT" ]; then
+            SHOULD_PROMOTE=true
+          else
+            SHOULD_PROMOTE=false
           fi
 
           {
             echo "tag=$TAG"
             echo "sha=$SHA"
             echo "changed=$CHANGED"
+            echo "should_promote=$SHOULD_PROMOTE"
           } >> "$GITHUB_OUTPUT"
-          echo "Resolved tag=$TAG sha=$SHA changed=$CHANGED"
+          echo "Resolved tag=$TAG sha=$SHA changed=$CHANGED should_promote=$SHOULD_PROMOTE"
 
       - name: Check init-db.sh drift
-        # Warning only — does not block the build. Surfaces vendored-script drift.
+        # Warning only — does not block the build. Historical tag rebuilds are
+        # skipped to avoid comparing old upstream tags against the latest baseline.
+        if: ${{ inputs.tag == '' }}
         env:
           UPSTREAM_TAG: ${{ steps.resolve.outputs.tag }}
         run: |
           if curl -fsSL "https://raw.githubusercontent.com/mem0ai/mem0/${UPSTREAM_TAG}/server/init-db.sh" \
-               | diff - init/init-db.sh > /dev/null; then
-            echo "init-db.sh: no drift"
+               | diff - init/init-db.upstream.sh > /dev/null; then
+            echo "init-db.sh upstream baseline: no drift"
           else
-            echo "::warning file=init/init-db.sh::Vendored init-db.sh diverges from upstream ${UPSTREAM_TAG}. Manual re-vendor required."
+            echo "::warning file=init/init-db.upstream.sh::Upstream init-db.sh diverges from the tracked baseline for ${UPSTREAM_TAG}. Review and refresh the local patch."
           fi
 
   # ---------------------------------------------------------------------------
@@ -183,11 +199,8 @@ jobs:
         with:
           images: ghcr.io/lhilton/${{ matrix.image }}
           tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' && inputs.tag == '' }}
             type=raw,value=${{ needs.check.outputs.tag }}
             type=semver,pattern={{version}},value=${{ needs.check.outputs.tag }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.check.outputs.tag }}
-            type=semver,pattern={{major}},value=${{ needs.check.outputs.tag }}
             type=raw,value=mem0-${{ needs.check.outputs.sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/mem0ai/mem0
@@ -247,13 +260,45 @@ jobs:
             --certificate-identity 'https://github.com/lhilton/mem0-container/.github/workflows/mem0-upstream-rebuild.yml@refs/heads/main' \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
-      - name: Promote :latest
-        # Only promote :latest when no manual tag dispatch was used (Tracking F2).
-        if: ${{ inputs.tag == '' }}
+      - name: Install crane
+        if: ${{ needs.check.outputs.should_promote == 'true' }}
+        uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+        with:
+          version: v0.21.7
+
+      - name: Promote mutable tags
+        if: ${{ needs.check.outputs.should_promote == 'true' }}
         env:
-          IMAGE: ghcr.io/lhilton/${{ matrix.image }}@${{ steps.build.outputs.digest }}
+          IMAGE_REPO: ghcr.io/lhilton/${{ matrix.image }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          UPSTREAM_TAG: ${{ needs.check.outputs.tag }}
+          CERTIFICATE_IDENTITY: https://github.com/lhilton/mem0-container/.github/workflows/mem0-upstream-rebuild.yml@refs/heads/main
         run: |
-          docker buildx imagetools create --tag ghcr.io/lhilton/${{ matrix.image }}:latest "$IMAGE"
+          set -euo pipefail
+
+          VERSION="${UPSTREAM_TAG#v}"
+          MAJOR="${VERSION%%.*}"
+          MINOR_PATCH="${VERSION#*.}"
+          MINOR="${MINOR_PATCH%%.*}"
+          PROMOTE_TAGS=("latest" "${MAJOR}.${MINOR}" "$MAJOR")
+
+          for tag in "${PROMOTE_TAGS[@]}"; do
+            ref="${IMAGE_REPO}:${tag}"
+            crane tag "${IMAGE_REPO}@${IMAGE_DIGEST}" "$tag"
+
+            promoted_digest=$(crane digest "$ref")
+            if [ "$promoted_digest" != "$IMAGE_DIGEST" ]; then
+              echo "::error::Promoted $ref points to $promoted_digest, expected $IMAGE_DIGEST"
+              exit 1
+            fi
+
+            cosign verify "$ref" \
+              --certificate-identity "$CERTIFICATE_IDENTITY" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com
+            cosign verify-attestation --type slsaprovenance "$ref" \
+              --certificate-identity "$CERTIFICATE_IDENTITY" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          done
 
   # ---------------------------------------------------------------------------
   # Job 3: commit the processed tag back to .upstream-release.
@@ -261,7 +306,7 @@ jobs:
   # ---------------------------------------------------------------------------
   commit-pin:
     needs: [check, build]
-    if: needs.check.outputs.changed == 'true' && inputs.tag == ''
+    if: needs.check.outputs.changed == 'true' && needs.check.outputs.should_promote == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write

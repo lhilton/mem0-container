@@ -61,20 +61,25 @@ wizard and call the API directly with that key.
 
 ## Available image tags
 
-Each build publishes the following tags (example for a `v2.0.8` release):
+Normal tracking builds (daily cron or `force: true` without a manual `tag`)
+publish exact release tags first, then promote mutable channel tags only after
+signature and attestation verification succeed. Example for `v2.0.8`:
 
 | Tag | Meaning |
 | --- | --- |
-| `:latest` | Most recent daily-cron build (only promoted when no manual `tag` dispatch was used) |
-| `:v2.0.8` | Full release tag |
-| `:2.0.8` | Release without the `v` prefix |
-| `:2.0` | Major.minor |
-| `:2` | Major |
-| `:mem0-<sha>` | Pinned to the upstream commit SHA |
+| `:v2.0.8` | Exact full release tag |
+| `:2.0.8` | Exact release tag without the `v` prefix |
+| `:mem0-<sha>` | Exact upstream commit SHA |
+| `:latest` | Mutable most-recent tracking build; promoted after verification |
+| `:2.0` | Mutable major.minor channel; promoted after verification |
+| `:2` | Mutable major channel; promoted after verification |
 
 > Note: `:v2.0.8` is populated on the first cron run because `.upstream-release`
 > is seeded at `v2.0.7` (one release behind current). Subsequent tags appear as
 > mem0 ships new releases.
+
+Manual historical rebuilds with `tag: vX.Y.Z` publish only `:vX.Y.Z`,
+`:X.Y.Z`, and `:mem0-<sha>`. They never move `:latest`, `:X.Y`, or `:X`.
 
 ## Configuration
 
@@ -89,6 +94,25 @@ errors:
 | `API_INTERNAL_URL` | mem0-dashboard (server-to-server) | The API URL reachable from the dashboard host (service DNS name under compose) |
 
 For a single-host `localhost` deploy the `.env.example` defaults are correct.
+
+`APP_DB_NAME` is used by the Postgres init scripts only when a fresh Postgres
+data volume is initialized. If you change it after data already exists, either
+create the database and `vector` extension manually or reset disposable local
+data with `docker compose -f docker-compose.sample.yaml down -v`.
+
+`MEM0_NETWORK_NAME` controls the Docker network used by the sample stack and
+the standalone migration runner. The default is `mem0_network`; set a unique
+value when running parallel stacks or isolated smoke tests.
+
+## Standalone migrations
+
+To run the one-shot migration container against an already-started sample
+Postgres service, run from the repository root:
+
+```bash
+docker compose -f docker-compose.sample.yaml up -d postgres
+docker compose --env-file .env -f scripts/alembic-migrate.yaml run --rm alembic-migrate
+```
 
 ## How to pull
 
@@ -142,10 +166,11 @@ MEM0_TELEMETRY=false
 GitHub → **Actions** → **mem0-upstream-rebuild** → **Run workflow**:
 
 - **`force: true`** — rebuilds the current latest release and re-promotes
-  `:latest`.
-- **`tag: vX.Y.Z`** — rebuilds a specific historical release tag. This will
-  **not** promote `:latest` and will **not** update `.upstream-release` (so the
-  daily cron's no-op detection is preserved).
+  `:latest`, `:X.Y`, and `:X` after verification.
+- **`tag: vX.Y.Z`** — always rebuilds that specific historical release tag,
+  even if it matches `.upstream-release`. This publishes only exact tags
+  (`:vX.Y.Z`, `:X.Y.Z`, and `:mem0-<sha>`), does **not** promote mutable channel
+  tags, and does **not** update `.upstream-release`.
 
 ## Image sizes (approximate)
 
@@ -162,15 +187,17 @@ have no storage limit; private packages are capped at 500 MB on the free tier.
 1. **`--reload` dev flag.** mem0's production `server/Dockerfile` runs uvicorn
    with `--reload` (a development flag). This is inherited verbatim from
    upstream.
-2. **Brief unsigned window for version tags.** Cosign signing happens **after**
-   the image push. There is a short window where a version tag exists but is not
-   yet signed. The `:latest` tag is promoted only after signing + attestation
+2. **Brief unsigned window for exact version tags.** Cosign signing happens
+   **after** the initial image push. There is a short window where `:vX.Y.Z`,
+   `:X.Y.Z`, and `:mem0-<sha>` exist but are not yet signed. Mutable tags
+   (`:latest`, `:X.Y`, and `:X`) are promoted only after signing + attestation
    verification succeed.
 3. **GHCR visibility.** Images are published **private** by default on first
    push. Manually flip them to public in the GitHub UI for unauthenticated pulls.
-4. **Vendored `init/init-db.sh`.** Pinned to mem0 `v2.0.8`. The workflow warns
-   in its logs when upstream changes (drift detection), but a manual re-vendor
-   is required to update it.
+4. **Patched `init/init-db.sh`.** The runtime script is locally patched from the
+   tracked `init/init-db.upstream.sh` baseline so `APP_DB_NAME` works. The
+   workflow warns when that upstream baseline drifts and a manual refresh is
+   required.
 
 ## Attribution
 
