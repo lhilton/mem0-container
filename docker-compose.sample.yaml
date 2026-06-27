@@ -1,0 +1,91 @@
+# =============================================================================
+# Sample deployment for mem0 using the auto-built GHCR images.
+#
+# Quickstart:
+#   cp .env.example .env        # then edit POSTGRES_PASSWORD + JWT_SECRET
+#   docker compose -f docker-compose.sample.yaml up -d
+#
+# Services come up in dependency order:
+#   postgres -> alembic-migrate (one-shot) -> mem0-server -> mem0-dashboard
+# =============================================================================
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+    volumes:
+      - postgres_db:/var/lib/postgresql/data
+      - ./init/init-db.sh:/docker-entrypoint-initdb.d/01-init-db.sh:ro
+      - ./init/init-extensions.sh:/docker-entrypoint-initdb.d/02-init-extensions.sh:ro
+    ports:
+      - "8432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -q -d postgres -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mem0_network
+
+  alembic-migrate:
+    image: ghcr.io/lhilton/mem0-server:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    command: sh -c "alembic upgrade head"
+    restart: "no"
+    networks:
+      - mem0_network
+
+  mem0-server:
+    image: ghcr.io/lhilton/mem0-server:latest
+    ports:
+      - "8888:8000"
+    env_file: .env
+    depends_on:
+      alembic-migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/auth/setup-status', timeout=2).status==200 else 1)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - mem0_network
+    volumes:
+      - mem0_history:/app/history
+
+  mem0-dashboard:
+    image: ghcr.io/lhilton/mem0-dashboard:latest
+    ports:
+      - "3000:3000"
+    env_file: .env
+    depends_on:
+      mem0-server:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - mem0_network
+
+volumes:
+  postgres_db:
+  mem0_history:
+
+networks:
+  mem0_network:
+    driver: bridge
