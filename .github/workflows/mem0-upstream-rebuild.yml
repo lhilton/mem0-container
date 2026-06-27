@@ -1,0 +1,290 @@
+# =============================================================================
+# mem0 upstream release tracker + multi-arch image builder.
+#
+# Polls mem0's Python SDK release tags daily (cron) and on manual dispatch,
+# resolves tag -> commit SHA (TOCTOU defense), builds the upstream Dockerfiles
+# verbatim, pushes multi-arch images to GHCR with cosign signing + SLSA
+# provenance, and commits the processed tag back to .upstream-release.
+#
+# Actions are pinned to SHAs resolved by T0a (see commit history). Dependabot
+# keeps them current (.github/dependabot.yml).
+# =============================================================================
+name: mem0 upstream rebuild
+
+on:
+  schedule:
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force a rebuild of the current latest release'
+        required: false
+        type: boolean
+        default: false
+      tag:
+        description: 'Rebuild a specific historical tag (e.g. v2.0.8). Will NOT promote :latest or update .upstream-release.'
+        required: false
+        type: string
+        default: ''
+
+# No workflow-level permissions — all grants are job-scoped.
+permissions: {}
+
+concurrency:
+  group: mem0-upstream-rebuild-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: resolve the latest mem0 release tag + commit SHA, decide if changed.
+  # Patch 1 (Round 3): validate/resolve/diff merged into ONE step because bash
+  # variables do not persist across GitHub Actions steps.
+  # ---------------------------------------------------------------------------
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.resolve.outputs.changed }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@<TBD>
+        with:
+          persist-credentials: false
+
+      - name: Validate input, resolve tag + SHA, compute changed
+        id: resolve
+        # inputs.tag is passed via env (injection defense — never interpolate
+        # ${{ inputs.tag }} directly into a bash double-quoted string).
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+          FORCE_INPUT: ${{ inputs.force }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # --- Validate tag input format (only if supplied) ---
+          if [ -n "$TAG_INPUT" ]; then
+            if [[ ! "$TAG_INPUT" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Invalid tag format (must match ^v[0-9]+\.[0-9]+\.[0-9]+\$)"
+              exit 1
+            fi
+          fi
+
+          # --- Resolve the tag to build ---
+          if [ -n "$TAG_INPUT" ]; then
+            TAG="$TAG_INPUT"
+          else
+            # jq --arg avoids JSON string-escape pitfalls (Momus F-01).
+            TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'Accept: application/vnd.github+json' \
+              'https://api.github.com/repos/mem0ai/mem0/releases?per_page=100' \
+              | jq -r --arg re '^v[0-9]+\.[0-9]+\.[0-9]+$' '
+                  [.[] | select(.tag_name | test($re)) | select(.prerelease == false) | select(.draft == false)]
+                  | sort_by(.published_at) | reverse | .[0].tag_name')
+          fi
+          test -n "$TAG" && [ "$TAG" != "null" ] || { echo "::error::No tag resolved"; exit 1; }
+
+          # --- Resolve tag -> commit SHA (dereference annotated tags; fail-closed) ---
+          RESP=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/mem0ai/mem0/git/refs/tags/$TAG")
+          TYPE=$(echo "$RESP" | jq -r '.object.type')
+          OBJ_SHA=$(echo "$RESP" | jq -r '.object.sha')
+          if [ "$TYPE" = "tag" ]; then
+            # Annotated tag — dereference via /git/tags/<sha>
+            SHA=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'Accept: application/vnd.github+json' \
+              "https://api.github.com/repos/mem0ai/mem0/git/tags/$OBJ_SHA" \
+              | jq -r '.object.sha')
+            test "$SHA" != "null" || { echo "::error::Could not dereference annotated tag $TAG"; exit 1; }
+          elif [ "$TYPE" = "commit" ]; then
+            SHA="$OBJ_SHA"
+          else
+            echo "::error::Unexpected object type '$TYPE' for tag $TAG"
+            exit 1
+          fi
+
+          # --- Decide if anything changed (or force was requested) ---
+          PINNED=$(cat .upstream-release 2>/dev/null || echo none)
+          if [ "$FORCE_INPUT" = "true" ] || [ "$PINNED" != "$TAG" ]; then
+            CHANGED=true
+          else
+            CHANGED=false
+          fi
+
+          echo "tag=$TAG"     >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA"     >> "$GITHUB_OUTPUT"
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag=$TAG sha=$SHA changed=$CHANGED"
+
+      - name: Check init-db.sh drift
+        # Warning only — does not block the build. Surfaces vendored-script drift.
+        env:
+          UPSTREAM_TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          if curl -fsSL "https://raw.githubusercontent.com/mem0ai/mem0/${UPSTREAM_TAG}/server/init-db.sh" \
+               | diff - init/init-db.sh > /dev/null; then
+            echo "init-db.sh: no drift"
+          else
+            echo "::warning file=init/init-db.sh::Vendored init-db.sh diverges from upstream ${UPSTREAM_TAG}. Manual re-vendor required."
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Job 2: build both images in a matrix. Only runs if something changed.
+  # ---------------------------------------------------------------------------
+  build:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: mem0-server
+            context: server
+            dockerfile: server/Dockerfile
+          - image: mem0-dashboard
+            context: server/dashboard
+            dockerfile: server/dashboard/Dockerfile
+    steps:
+      - name: Checkout mem0 source
+        uses: actions/checkout@<TBD>
+        with:
+          repository: mem0ai/mem0
+          ref: ${{ needs.check.outputs.sha }}
+          path: mem0
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify SHA matches resolved value (TOCTOU defense)
+        env:
+          EXPECTED_SHA: ${{ needs.check.outputs.sha }}
+        run: |
+          cd mem0
+          ACTUAL_SHA=$(git rev-parse HEAD)
+          test "$ACTUAL_SHA" = "$EXPECTED_SHA" || {
+            echo "::error::SHA mismatch — tag may have been moved between check and checkout (expected $EXPECTED_SHA, got $ACTUAL_SHA)"
+            exit 1
+          }
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@<TBD>
+        with:
+          images: ghcr.io/lhilton/${{ matrix.image }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' && inputs.tag == '' }}
+            type=raw,value=${{ needs.check.outputs.tag }}
+            type=semver,pattern={{version}},value=${{ needs.check.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.check.outputs.tag }}
+            type=semver,pattern={{major}},value=${{ needs.check.outputs.tag }}
+            type=raw,value=mem0-${{ needs.check.outputs.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/mem0ai/mem0
+            org.opencontainers.image.revision=${{ needs.check.outputs.sha }}
+            org.opencontainers.image.vendor=lhilton
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@<TBD>
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@<TBD>
+
+      - name: Login to GHCR
+        uses: docker/login-action@<TBD>
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@<TBD>
+        with:
+          context: mem0/${{ matrix.context }}
+          file: mem0/${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: true
+          sbom: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ needs.check.outputs.tag }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ needs.check.outputs.tag }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@<TBD>
+
+      - name: Sign image
+        env:
+          IMAGE: ghcr.io/lhilton/${{ matrix.image }}@${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "$IMAGE"
+
+      - name: Verify signature (strict identity)
+        env:
+          IMAGE: ghcr.io/lhilton/${{ matrix.image }}@${{ steps.build.outputs.digest }}
+        run: |
+          cosign verify "$IMAGE" \
+            --certificate-identity 'https://github.com/lhilton/mem0-container/.github/workflows/mem0-upstream-rebuild.yml@refs/heads/main' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+      - name: Verify SLSA provenance attestation (strict identity)
+        env:
+          IMAGE: ghcr.io/lhilton/${{ matrix.image }}@${{ steps.build.outputs.digest }}
+        run: |
+          cosign verify-attestation --type slsaprovenance "$IMAGE" \
+            --certificate-identity 'https://github.com/lhilton/mem0-container/.github/workflows/mem0-upstream-rebuild.yml@refs/heads/main' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+      - name: Promote :latest
+        # Only promote :latest when no manual tag dispatch was used (Tracking F2).
+        if: ${{ inputs.tag == '' }}
+        env:
+          IMAGE: ghcr.io/lhilton/${{ matrix.image }}@${{ steps.build.outputs.digest }}
+        run: |
+          docker buildx imagetools create --tag ghcr.io/lhilton/${{ matrix.image }}:latest "$IMAGE"
+
+  # ---------------------------------------------------------------------------
+  # Job 3: commit the processed tag back to .upstream-release.
+  # Skipped for manual tag dispatches (preserves cron's no-op detection).
+  # ---------------------------------------------------------------------------
+  commit-pin:
+    needs: [check, build]
+    if: needs.check.outputs.changed == 'true' && inputs.tag == ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@<TBD>
+        with:
+          persist-credentials: true
+
+      - name: Commit and push .upstream-release
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          SHA: ${{ needs.check.outputs.sha }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          echo "$TAG" > .upstream-release
+          git add .upstream-release
+          if git diff --cached --quiet; then
+            echo "no change to commit"
+            exit 0
+          fi
+          git commit -m "chore(upstream): mem0 @ $TAG ($SHA)"
+          # Idempotent push: fetch first, then push (no rebase — fails loudly on conflict).
+          git fetch origin "$BRANCH"
+          git push origin HEAD:"$BRANCH"
