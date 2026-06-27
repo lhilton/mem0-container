@@ -115,9 +115,11 @@ jobs:
             CHANGED=false
           fi
 
-          echo "tag=$TAG"     >> "$GITHUB_OUTPUT"
-          echo "sha=$SHA"     >> "$GITHUB_OUTPUT"
-          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=$TAG"
+            echo "sha=$SHA"
+            echo "changed=$CHANGED"
+          } >> "$GITHUB_OUTPUT"
           echo "Resolved tag=$TAG sha=$SHA changed=$CHANGED"
 
       - name: Check init-db.sh drift
