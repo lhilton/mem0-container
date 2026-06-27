@@ -1,0 +1,22 @@
+# =============================================================================
+# Standalone alembic migration runner.
+#
+# Usage:
+#   docker compose -f docker-compose.sample.yaml up -d postgres
+#   docker compose -f scripts/alembic-migrate.yaml run --rm alembic-migrate
+#
+# IMPORTANT: this network is declared `external: true` so it JOINS the network
+# created by docker-compose.sample.yaml rather than creating a new one.
+# =============================================================================
+services:
+  alembic-migrate:
+    image: ghcr.io/lhilton/mem0-server:latest
+    env_file: ../.env
+    command: sh -c "alembic upgrade head"
+    networks:
+      - mem0_network
+
+networks:
+  mem0_network:
+    name: mem0_network
+    external: true
