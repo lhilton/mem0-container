@@ -5,7 +5,7 @@
 
 # --- Agent / tooling state (not shipped) ---
 .omo/
-.codegraph/
+.codegraph
 .context/
 
 # --- macOS ---
