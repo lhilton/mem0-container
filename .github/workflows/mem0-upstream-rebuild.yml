@@ -50,7 +50,7 @@ jobs:
       sha: ${{ steps.resolve.outputs.sha }}
     steps:
       - name: Checkout this repo
-        uses: actions/checkout@<TBD>
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
 
@@ -156,7 +156,7 @@ jobs:
             dockerfile: server/dashboard/Dockerfile
     steps:
       - name: Checkout mem0 source
-        uses: actions/checkout@<TBD>
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: mem0ai/mem0
           ref: ${{ needs.check.outputs.sha }}
@@ -177,7 +177,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@<TBD>
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ghcr.io/lhilton/${{ matrix.image }}
           tags: |
@@ -194,13 +194,13 @@ jobs:
             org.opencontainers.image.licenses=Apache-2.0
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@<TBD>
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@<TBD>
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Login to GHCR
-        uses: docker/login-action@<TBD>
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -208,7 +208,7 @@ jobs:
 
       - name: Build and push
         id: build
-        uses: docker/build-push-action@<TBD>
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: mem0/${{ matrix.context }}
           file: mem0/${{ matrix.dockerfile }}
@@ -222,7 +222,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ needs.check.outputs.tag }}
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@<TBD>
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
       - name: Sign image
         env:
@@ -265,7 +265,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout this repo
-        uses: actions/checkout@<TBD>
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: true
 
