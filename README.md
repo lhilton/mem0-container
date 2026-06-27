@@ -1,145 +1,283 @@
 # mem0-container
 
-Automatically rebuilds and publishes [mem0](https://github.com/mem0ai/mem0)'s
-official **server** and **dashboard** Docker images to the GitHub Container
-Registry every time mem0 ships a new Python SDK release.
+Pre-built, automatically updated Docker images for [mem0](https://github.com/mem0ai/mem0)'s
+**server** API and **dashboard** web UI, published to GitHub Container Registry with cosign
+signatures and SLSA provenance.
 
-mem0 does not publish container images, but they ship buildable Dockerfiles and
-release Python SDK versions regularly (tagged `v2.0.x`). This repo polls those
-release tags daily, resolves the tag to a commit SHA, builds the upstream
-Dockerfiles verbatim (zero drift), and pushes multi-arch (Intel + ARM) images
-with cosign signing and SLSA provenance.
-
-## What this repo does
-
-- Polls the mem0 release tags once a day (cron) and on manual dispatch.
-- Builds `server/Dockerfile` and `server/dashboard/Dockerfile` from the mem0
-  source tree at the resolved commit SHA.
-- Publishes two independently-pullable images to GHCR:
-  - `ghcr.io/lhilton/mem0-server`
-  - `ghcr.io/lhilton/mem0-dashboard`
-- Signs every image with cosign (keyless) and attaches SLSA provenance + SBOM.
-- Commits the processed tag back to `.upstream-release` so the next run is a
-  no-op until mem0 ships again.
+mem0 ships Dockerfiles but does not publish container images. This repo tracks mem0's Python SDK
+release tags, builds the upstream Dockerfiles, and publishes multi-arch images for `linux/amd64`
+and `linux/arm64`.
 
 ## Quickstart
 
+Clone this repo and run the setup commands from the repo root:
+
 ```bash
+git clone https://github.com/lhilton/mem0-container.git
+cd mem0-container
 cp .env.example .env
-# edit .env — at minimum set POSTGRES_PASSWORD and JWT_SECRET
+```
+
+Edit `.env` before starting the stack:
+
+- Set `POSTGRES_PASSWORD` to a real Postgres password.
+- Set `JWT_SECRET` to a random 32+ character string, for example `openssl rand -hex 32`.
+- Set at least one provider key expected by your mem0 usage, such as `OPENAI_API_KEY`.
+- Optionally set `ADMIN_API_KEY` before first boot to skip the dashboard setup wizard.
+
+If GHCR returns `denied` while pulling these images, either make the GitHub packages public or log in
+with a token that has `read:packages`:
+
+```bash
+echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+```
+
+Start the sample stack:
+
+```bash
+docker compose -f docker-compose.sample.yaml up -d
+docker compose -f docker-compose.sample.yaml ps
+```
+
+Services start in this order:
+
+```text
+postgres -> alembic-migrate (one-shot) -> mem0-server -> mem0-dashboard
+```
+
+Once healthy:
+
+| Service | URL |
+|---|---|
+| Dashboard | http://localhost:3000 |
+| API server | http://localhost:8888 |
+| Postgres, from host | localhost:8432 |
+
+Open http://localhost:3000/setup on first launch to create the first admin user. If
+`ADMIN_API_KEY` was set before first boot, mem0 bootstraps that key as the first admin instead.
+
+Useful local commands:
+
+```bash
+docker compose -f docker-compose.sample.yaml logs -f mem0-server mem0-dashboard
+docker compose -f docker-compose.sample.yaml down
+docker compose -f docker-compose.sample.yaml down -v
+```
+
+`down -v` deletes the sample stack's named volumes, including Postgres data. Use it only for
+disposable local deployments.
+
+## Compose Reference
+
+`docker-compose.sample.yaml` is the canonical Compose example for this repo. Prefer using it as-is
+or copying it whole, rather than copying a partial YAML snippet from documentation.
+
+The sample stack contains:
+
+| Service | Image | Purpose |
+|---|---|---|
+| `postgres` | `pgvector/pgvector:pg17` | PostgreSQL 17 plus pgvector |
+| `alembic-migrate` | `ghcr.io/lhilton/mem0-server:latest` | One-shot database migration |
+| `mem0-server` | `ghcr.io/lhilton/mem0-server:latest` | mem0 API |
+| `mem0-dashboard` | `ghcr.io/lhilton/mem0-dashboard:latest` | mem0 web UI |
+
+The sample uses two named volumes:
+
+- `postgres_db` for Postgres data.
+- `mem0_history` for the server's SQLite history path at `/app/history`.
+
+The sample uses one Docker network named by `MEM0_NETWORK_NAME`, defaulting to `mem0_network`.
+Set a unique `MEM0_NETWORK_NAME` when running parallel stacks or smoke tests on the same Docker
+host.
+
+## Database Configuration
+
+The sample has two database names with different jobs:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `POSTGRES_DB` | `postgres` | Database used by pgvector memory storage |
+| `APP_DB_NAME` | `mem0_app` | Application database for users, auth, and API keys |
+
+The Postgres init scripts in `init/` create `APP_DB_NAME` and enable the `vector` extension when a
+fresh Postgres volume is initialized. Changing `APP_DB_NAME` after Postgres data already exists does
+not rename or create a new database. For an existing volume, create the database and extension
+manually, or reset a disposable local stack:
+
+```bash
+docker compose -f docker-compose.sample.yaml down -v
 docker compose -f docker-compose.sample.yaml up -d
 ```
 
-The sample compose also starts a `postgres` service using the upstream
-`pgvector/pgvector:pg17` image (PostgreSQL 17 with the pgvector extension) for
-memory storage. It is not republished — pull it directly from Docker Hub.
-
-Services come up in dependency order:
-`postgres` → `alembic-migrate` (one-shot) → `mem0-server` → `mem0-dashboard`.
-
-Once healthy:
-- Dashboard: http://localhost:3000
-- API: http://localhost:8888
-
-## First-admin bootstrap
-
-There are exactly **two** ways to create the first admin user:
-
-### (a) Browser setup wizard
-
-After `docker compose up`, open http://localhost:3000/setup and complete the
-wizard. This is the default path for a fresh deploy with zero users.
-
-### (b) Pre-set `ADMIN_API_KEY`
-
-Set `ADMIN_API_KEY=<random-string>` in `.env` **before** the first `up`. mem0
-bootstraps this key as an admin when zero users exist, letting you skip the
-wizard and call the API directly with that key.
-
-> There is no third path. If both are unset on a deploy with existing users,
-> use an existing admin's credentials.
-
-## Available image tags
-
-Normal tracking builds (daily cron or `force: true` without a manual `tag`)
-publish exact release tags first, then promote mutable channel tags only after
-signature and attestation verification succeed. Example for `v2.0.8`:
-
-| Tag | Meaning |
-| --- | --- |
-| `:v2.0.8` | Exact full release tag |
-| `:2.0.8` | Exact release tag without the `v` prefix |
-| `:mem0-<sha>` | Exact upstream commit SHA |
-| `:latest` | Mutable most-recent tracking build; promoted after verification |
-| `:2.0` | Mutable major.minor channel; promoted after verification |
-| `:2` | Mutable major channel; promoted after verification |
-
-> Note: `:v2.0.8` is populated on the first cron run because `.upstream-release`
-> is seeded at `v2.0.7` (one release behind current). Subsequent tags appear as
-> mem0 ships new releases.
-
-Manual historical rebuilds with `tag: vX.Y.Z` publish only `:vX.Y.Z`,
-`:X.Y.Z`, and `:mem0-<sha>`. They never move `:latest`, `:X.Y`, or `:X`.
-
 ## Configuration
 
-The sample compose reads everything from `.env` (see `.env.example`). Three
-URLs **must match your deployment topology** or you will get CORS / mixed-origin
-errors:
+Copy `.env.example` to `.env` and fill in deployment-specific values.
+
+Required:
+
+| Variable | Description |
+|---|---|
+| `POSTGRES_PASSWORD` | Postgres password. The sample Compose file refuses to start without it. |
+| `JWT_SECRET` | Random 32+ character string used to sign JWTs. |
+
+URLs that must match your topology:
 
 | Variable | Seen by | Must match |
-| --- | --- | --- |
-| `DASHBOARD_URL` | mem0-server (CORS origin) | Your dashboard's externally-reachable URL |
-| `NEXT_PUBLIC_API_URL` | The browser | Your API's externally-reachable URL |
-| `API_INTERNAL_URL` | mem0-dashboard (server-to-server) | The API URL reachable from the dashboard host (service DNS name under compose) |
+|---|---|---|
+| `DASHBOARD_URL` | `mem0-server` CORS checks | Dashboard URL reachable by users |
+| `NEXT_PUBLIC_API_URL` | Browser | API URL reachable by users' browsers |
+| `API_INTERNAL_URL` | `mem0-dashboard` server process | API URL reachable from the dashboard container or host |
 
-For a single-host `localhost` deploy the `.env.example` defaults are correct.
+For the sample `localhost` deployment, the `.env.example` URL defaults are correct.
 
-`APP_DB_NAME` is used by the Postgres init scripts only when a fresh Postgres
-data volume is initialized. If you change it after data already exists, either
-create the database and `vector` extension manually or reset disposable local
-data with `docker compose -f docker-compose.sample.yaml down -v`.
+Common optional values:
 
-`MEM0_NETWORK_NAME` controls the Docker network used by the sample stack and
-the standalone migration runner. The default is `mem0_network`; set a unique
-value when running parallel stacks or isolated smoke tests.
+| Variable | Default | Description |
+|---|---|---|
+| `POSTGRES_USER` | `postgres` | Postgres user used by the sample stack |
+| `POSTGRES_DB` | `postgres` | pgvector memory database |
+| `APP_DB_NAME` | `mem0_app` | Application database; honored by init scripts only on fresh volumes |
+| `MEM0_NETWORK_NAME` | `mem0_network` | Docker network name shared by the sample stack and standalone migration runner |
+| `MEM0_TELEMETRY` | `true` | Upstream mem0 PostHog telemetry toggle; set `false` to opt out |
+| `ADMIN_API_KEY` | empty | Optional first admin API key for fresh deployments |
+| `OPENAI_API_KEY` | empty | Provider key; use another supported provider key if preferred |
 
-## Standalone migrations
+## First Admin Bootstrap
 
-To run the one-shot migration container against an already-started sample
-Postgres service, run from the repository root:
+There are two supported first-admin paths:
+
+1. Browser setup wizard: after the stack is running, open http://localhost:3000/setup and complete
+   the wizard.
+2. Pre-set admin key: set `ADMIN_API_KEY=<random-string>` in `.env` before the first `up`.
+
+Both paths only apply when the application database has zero users.
+
+## Standalone Migrations
+
+Use the standalone migration runner when Postgres is already running and you want to rerun Alembic
+without starting the whole sample stack. Run this from the repo root:
 
 ```bash
 docker compose -f docker-compose.sample.yaml up -d postgres
 docker compose --env-file .env -f scripts/alembic-migrate.yaml run --rm alembic-migrate
 ```
 
-## How to pull
+The standalone file joins the existing Docker network instead of creating a new one. If you set
+`MEM0_NETWORK_NAME` for the sample stack, use the same `.env` file for the standalone migration
+command.
+
+## Advanced Docker CLI Usage
+
+Compose is the recommended path. If you need raw `docker run` commands, run them from the repo root
+so the `init/` bind mounts resolve correctly.
+
+```bash
+export MEM0_POSTGRES_PASSWORD='change-me'
+export MEM0_JWT_SECRET="$(openssl rand -hex 32)"
+export MEM0_OPENAI_API_KEY='sk-your-key'
+
+docker network create mem0-cli-net
+
+docker run -d --name mem0-cli-postgres \
+  --network mem0-cli-net \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD="$MEM0_POSTGRES_PASSWORD" \
+  -e POSTGRES_DB=postgres \
+  -e APP_DB_NAME=mem0_app \
+  -v mem0_cli_pgdata:/var/lib/postgresql/data \
+  -v "$PWD/init/init-db.sh:/docker-entrypoint-initdb.d/01-init-db.sh:ro" \
+  -v "$PWD/init/init-extensions.sh:/docker-entrypoint-initdb.d/02-init-extensions.sh:ro" \
+  pgvector/pgvector:pg17
+
+until docker exec mem0-cli-postgres pg_isready -q -d postgres -U postgres; do
+  sleep 1
+done
+
+docker run --rm --network mem0-cli-net \
+  -e POSTGRES_HOST=mem0-cli-postgres \
+  -e POSTGRES_PORT=5432 \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD="$MEM0_POSTGRES_PASSWORD" \
+  -e POSTGRES_DB=postgres \
+  -e APP_DB_NAME=mem0_app \
+  ghcr.io/lhilton/mem0-server:latest \
+  sh -c "alembic upgrade head"
+
+docker run -d --name mem0-cli-server \
+  --network mem0-cli-net \
+  -p 8888:8000 \
+  -e POSTGRES_HOST=mem0-cli-postgres \
+  -e POSTGRES_PORT=5432 \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD="$MEM0_POSTGRES_PASSWORD" \
+  -e POSTGRES_DB=postgres \
+  -e APP_DB_NAME=mem0_app \
+  -e JWT_SECRET="$MEM0_JWT_SECRET" \
+  -e OPENAI_API_KEY="$MEM0_OPENAI_API_KEY" \
+  -e DASHBOARD_URL=http://localhost:3000 \
+  -e HISTORY_DB_PATH=/app/history/history.db \
+  -v mem0_cli_history:/app/history \
+  ghcr.io/lhilton/mem0-server:latest
+
+docker run -d --name mem0-cli-dashboard \
+  --network mem0-cli-net \
+  -p 3000:3000 \
+  -e API_INTERNAL_URL=http://mem0-cli-server:8000 \
+  -e NEXT_PUBLIC_API_URL=http://localhost:8888 \
+  -e NEXT_PUBLIC_INSTANCE_NAME=Mem0 \
+  ghcr.io/lhilton/mem0-dashboard:latest
+```
+
+Cleanup for the raw Docker example:
+
+```bash
+docker rm -f mem0-cli-dashboard mem0-cli-server mem0-cli-postgres
+docker network rm mem0-cli-net
+docker volume rm mem0_cli_pgdata mem0_cli_history
+```
+
+## Available Image Tags
+
+Normal tracking builds, including daily cron runs and manual `force: true` runs without a manual
+`tag`, publish exact tags first. After the built digest has a verified cosign signature and SLSA
+provenance attestation, the workflow promotes mutable channel tags to that same digest.
+
+Example for upstream release `v2.0.8`:
+
+| Tag | Meaning |
+|---|---|
+| `:v2.0.8` | Exact upstream release tag |
+| `:2.0.8` | Exact upstream release tag without the `v` prefix |
+| `:mem0-<sha>` | Exact upstream commit SHA |
+| `:latest` | Mutable latest verified tracking build |
+| `:2.0` | Mutable major.minor channel |
+| `:2` | Mutable major channel |
+
+Manual historical rebuilds with `tag: vX.Y.Z` always rebuild that tag, even when it matches
+`.upstream-release`. They publish only the three exact tags, never move `:latest`, `:X.Y`, or `:X`,
+and never update `.upstream-release`.
+
+## Pulling Images
 
 ```bash
 docker pull ghcr.io/lhilton/mem0-server:latest
 docker pull ghcr.io/lhilton/mem0-dashboard:latest
 ```
 
-> GHCR packages are published **private** by default on first push. Flip them to
-> public in the GitHub UI (Packages → settings) if you want unauthenticated
-> pulls.
+GitHub packages are private by default on first publish. Anonymous pulls work only after the package
+owner makes both GHCR packages public; otherwise authenticate with `docker login ghcr.io`.
 
-## How to verify signatures (REQUIRED for production use)
+## Verifying Images
 
-Every image is signed with cosign keyless signing and carries a SLSA provenance
-attestation. Verify before trusting any pulled image:
+For production use, verify both the image signature and SLSA provenance attestation with the strict
+workflow identity:
 
 ```bash
 cosign verify \
   --certificate-identity 'https://github.com/lhilton/mem0-container/.github/workflows/mem0-upstream-rebuild.yml@refs/heads/main' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   ghcr.io/lhilton/mem0-server:latest
-```
 
-Verify the SLSA provenance attestation:
-
-```bash
 cosign verify-attestation --type slsaprovenance \
   --certificate-identity 'https://github.com/lhilton/mem0-container/.github/workflows/mem0-upstream-rebuild.yml@refs/heads/main' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
@@ -148,60 +286,50 @@ cosign verify-attestation --type slsaprovenance \
 
 Replace `mem0-server` with `mem0-dashboard` to verify the dashboard image.
 
-> Use the exact `--certificate-identity` string above. Do **not** use a loose
-> wildcard identity (the `...-regexp` variant) — strict identity matching
-> prevents a different workflow or repo from satisfying the verify.
+Exact tags such as `:vX.Y.Z`, `:X.Y.Z`, and `:mem0-<sha>` are pushed before signing, so there can be
+a brief window where an exact tag exists but verification does not yet pass. Mutable tags
+`:latest`, `:X.Y`, and `:X` are promoted only after verification succeeds.
 
-## Telemetry notice
+## How Images Are Published
 
-mem0's PostHog telemetry is **ON by default** in the upstream image. To opt out,
-set in `.env`:
+The release workflow runs daily at 09:17 UTC and can be run manually from GitHub Actions. It:
 
-```env
-MEM0_TELEMETRY=false
-```
+1. Resolves the latest non-prerelease mem0 `vX.Y.Z` release tag, or validates a manual `tag`.
+2. Resolves the tag to a commit SHA and checks whether a build is needed.
+3. Builds `mem0-server` and `mem0-dashboard` from the upstream mem0 source at that SHA.
+4. Pushes exact tags, signs the built digest, and verifies the signature and SLSA attestation.
+5. Promotes mutable tags only for normal tracking builds.
+6. Updates `.upstream-release` only for normal tracking builds.
 
-## How to manually trigger a rebuild
+Manual dispatch options:
 
-GitHub → **Actions** → **mem0-upstream-rebuild** → **Run workflow**:
+- `force: true` rebuilds the current latest release and re-promotes mutable tags after verification.
+- `tag: vX.Y.Z` rebuilds a specific historical release and never promotes mutable tags.
 
-- **`force: true`** — rebuilds the current latest release and re-promotes
-  `:latest`, `:X.Y`, and `:X` after verification.
-- **`tag: vX.Y.Z`** — always rebuilds that specific historical release tag,
-  even if it matches `.upstream-release`. This publishes only exact tags
-  (`:vX.Y.Z`, `:X.Y.Z`, and `:mem0-<sha>`), does **not** promote mutable channel
-  tags, and does **not** update `.upstream-release`.
+The workflow fails before building or pushing unless it is running on `refs/heads/main`, matching the
+strict OIDC identity used by cosign verification.
 
-## Image sizes (approximate)
+## Image Sizes
 
-| Image | Per-arch size |
-| --- | --- |
-| `mem0-server` | ~800 MB – 1.2 GB |
-| `mem0-dashboard` | ~300 – 500 MB |
+| Image | Approximate per-arch size |
+|---|---|
+| `mem0-server` | 800 MB to 1.2 GB |
+| `mem0-dashboard` | 300 MB to 500 MB |
 
-Multi-arch (amd64 + arm64) roughly doubles the stored size. GHCR public packages
-have no storage limit; private packages are capped at 500 MB on the free tier.
+Multi-arch images store separate architecture manifests, so registry storage is larger than a
+single pulled image.
 
-## Known limitations
+## Known Limitations
 
-1. **`--reload` dev flag.** mem0's production `server/Dockerfile` runs uvicorn
-   with `--reload` (a development flag). This is inherited verbatim from
-   upstream.
-2. **Brief unsigned window for exact version tags.** Cosign signing happens
-   **after** the initial image push. There is a short window where `:vX.Y.Z`,
-   `:X.Y.Z`, and `:mem0-<sha>` exist but are not yet signed. Mutable tags
-   (`:latest`, `:X.Y`, and `:X`) are promoted only after signing + attestation
-   verification succeed.
-3. **GHCR visibility.** Images are published **private** by default on first
-   push. Manually flip them to public in the GitHub UI for unauthenticated pulls.
-4. **Patched `init/init-db.sh`.** The runtime script is locally patched from the
-   tracked `init/init-db.upstream.sh` baseline so `APP_DB_NAME` works. The
-   workflow warns when that upstream baseline drifts and a manual refresh is
-   required.
+1. mem0's upstream production `server/Dockerfile` currently runs uvicorn with `--reload`; this repo
+   inherits that behavior from upstream.
+2. GHCR packages may need to be made public manually before anonymous pulls work.
+3. `init/init-db.sh` is locally patched from `init/init-db.upstream.sh` so `APP_DB_NAME` works. The
+   workflow warns when the tracked upstream baseline drifts.
 
 ## Attribution
 
 mem0 source: https://github.com/mem0ai/mem0
 
-This repo packages mem0's Dockerfiles for automated GHCR publishing. It does not
-own or modify the mem0 source.
+This repo packages mem0's Dockerfiles for automated GHCR publishing. It does not own or modify the
+mem0 source.
