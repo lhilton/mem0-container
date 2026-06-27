@@ -51,7 +51,7 @@ jobs:
       should_promote: ${{ steps.resolve.outputs.should_promote }}
     steps:
       - name: Checkout this repo
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
@@ -174,7 +174,7 @@ jobs:
             dockerfile: server/dashboard/Dockerfile
     steps:
       - name: Checkout mem0 source
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: mem0ai/mem0
           ref: ${{ needs.check.outputs.sha }}
@@ -312,7 +312,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout this repo
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: true
 
