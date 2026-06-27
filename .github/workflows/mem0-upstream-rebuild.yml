@@ -1,0 +1,337 @@
+# =============================================================================
+# mem0 upstream release tracker + multi-arch image builder.
+#
+# Polls mem0's Python SDK release tags daily (cron) and on manual dispatch,
+# resolves tag -> commit SHA (TOCTOU defense), builds the upstream Dockerfiles
+# verbatim, pushes multi-arch images to GHCR with cosign signing + SLSA
+# provenance, and commits the processed tag back to .upstream-release.
+#
+# Actions are pinned to SHAs resolved by T0a (see commit history). Dependabot
+# keeps them current (.github/dependabot.yml).
+# =============================================================================
+name: mem0 upstream rebuild
+
+on:
+  schedule:
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force a rebuild of the current latest release'
+        required: false
+        type: boolean
+        default: false
+      tag:
+        description: 'Rebuild a specific historical tag (e.g. v2.0.8). Will NOT promote :latest or update .upstream-release.'
+        required: false
+        type: string
+        default: ''
+
+# No workflow-level permissions — all grants are job-scoped.
+permissions: {}
+
+concurrency:
+  group: mem0-upstream-rebuild-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: resolve the latest mem0 release tag + commit SHA, decide if changed.
+  # Patch 1 (Round 3): validate/resolve/diff merged into ONE step because bash
+  # variables do not persist across GitHub Actions steps.
+  # ---------------------------------------------------------------------------
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.resolve.outputs.changed }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      should_promote: ${{ steps.resolve.outputs.should_promote }}
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Validate input, resolve tag + SHA, compute changed
+        id: resolve
+        # inputs.tag is passed via env (injection defense — never interpolate
+        # ${{ inputs.tag }} directly into a bash double-quoted string).
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+          FORCE_INPUT: ${{ inputs.force }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # This workflow signs and verifies with the main-branch OIDC
+          # identity, so fail before any build/push when dispatched elsewhere.
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::This workflow may only publish from refs/heads/main (got $GITHUB_REF)"
+            exit 1
+          fi
+
+          # --- Validate tag input format (only if supplied) ---
+          if [ -n "$TAG_INPUT" ]; then
+            if [[ ! "$TAG_INPUT" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Invalid tag format (must match ^v[0-9]+\.[0-9]+\.[0-9]+\$)"
+              exit 1
+            fi
+          fi
+
+          # --- Resolve the tag to build ---
+          if [ -n "$TAG_INPUT" ]; then
+            TAG="$TAG_INPUT"
+          else
+            # jq --arg avoids JSON string-escape pitfalls (Momus F-01).
+            TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'Accept: application/vnd.github+json' \
+              'https://api.github.com/repos/mem0ai/mem0/releases?per_page=100' \
+              | jq -r --arg re '^v[0-9]+\.[0-9]+\.[0-9]+$' '
+                  [.[] | select(.tag_name | test($re)) | select(.prerelease == false) | select(.draft == false)]
+                  | sort_by(.published_at) | reverse | .[0].tag_name')
+          fi
+          test -n "$TAG" && [ "$TAG" != "null" ] || { echo "::error::No tag resolved"; exit 1; }
+
+          # --- Resolve tag -> commit SHA (dereference annotated tags; fail-closed) ---
+          RESP=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/mem0ai/mem0/git/refs/tags/$TAG")
+          TYPE=$(echo "$RESP" | jq -r '.object.type')
+          OBJ_SHA=$(echo "$RESP" | jq -r '.object.sha')
+          if [ "$TYPE" = "tag" ]; then
+            # Annotated tag — dereference via /git/tags/<sha>
+            SHA=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'Accept: application/vnd.github+json' \
+              "https://api.github.com/repos/mem0ai/mem0/git/tags/$OBJ_SHA" \
+              | jq -r '.object.sha')
+            test "$SHA" != "null" || { echo "::error::Could not dereference annotated tag $TAG"; exit 1; }
+          elif [ "$TYPE" = "commit" ]; then
+            SHA="$OBJ_SHA"
+          else
+            echo "::error::Unexpected object type '$TYPE' for tag $TAG"
+            exit 1
+          fi
+
+          # --- Decide if anything changed (or force was requested) ---
+          PINNED=$(cat .upstream-release 2>/dev/null || echo none)
+          if [ "$FORCE_INPUT" = "true" ] || [ -n "$TAG_INPUT" ] || [ "$PINNED" != "$TAG" ]; then
+            CHANGED=true
+          else
+            CHANGED=false
+          fi
+          if [ -z "$TAG_INPUT" ]; then
+            SHOULD_PROMOTE=true
+          else
+            SHOULD_PROMOTE=false
+          fi
+
+          {
+            echo "tag=$TAG"
+            echo "sha=$SHA"
+            echo "changed=$CHANGED"
+            echo "should_promote=$SHOULD_PROMOTE"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved tag=$TAG sha=$SHA changed=$CHANGED should_promote=$SHOULD_PROMOTE"
+
+      - name: Check init-db.sh drift
+        # Warning only — does not block the build. Historical tag rebuilds are
+        # skipped to avoid comparing old upstream tags against the latest baseline.
+        if: ${{ inputs.tag == '' }}
+        env:
+          UPSTREAM_TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          if curl -fsSL "https://raw.githubusercontent.com/mem0ai/mem0/${UPSTREAM_TAG}/server/init-db.sh" \
+               | diff - init/init-db.upstream.sh > /dev/null; then
+            echo "init-db.sh upstream baseline: no drift"
+          else
+            echo "::warning file=init/init-db.upstream.sh::Upstream init-db.sh diverges from the tracked baseline for ${UPSTREAM_TAG}. Review and refresh the local patch."
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Job 2: build both images in a matrix. Only runs if something changed.
+  # ---------------------------------------------------------------------------
+  build:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: mem0-server
+            context: server
+            dockerfile: server/Dockerfile
+          - image: mem0-dashboard
+            context: server/dashboard
+            dockerfile: server/dashboard/Dockerfile
+    steps:
+      - name: Checkout mem0 source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: mem0ai/mem0
+          ref: ${{ needs.check.outputs.sha }}
+          path: mem0
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify SHA matches resolved value (TOCTOU defense)
+        env:
+          EXPECTED_SHA: ${{ needs.check.outputs.sha }}
+        run: |
+          cd mem0
+          ACTUAL_SHA=$(git rev-parse HEAD)
+          test "$ACTUAL_SHA" = "$EXPECTED_SHA" || {
+            echo "::error::SHA mismatch — tag may have been moved between check and checkout (expected $EXPECTED_SHA, got $ACTUAL_SHA)"
+            exit 1
+          }
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ghcr.io/lhilton/${{ matrix.image }}
+          tags: |
+            type=raw,value=${{ needs.check.outputs.tag }}
+            type=semver,pattern={{version}},value=${{ needs.check.outputs.tag }}
+            type=raw,value=mem0-${{ needs.check.outputs.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/mem0ai/mem0
+            org.opencontainers.image.revision=${{ needs.check.outputs.sha }}
+            org.opencontainers.image.vendor=lhilton
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        with:
+          context: mem0/${{ matrix.context }}
+          file: mem0/${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: true
+          sbom: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ needs.check.outputs.tag }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ needs.check.outputs.tag }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - name: Sign image
+        env:
+          IMAGE: ghcr.io/lhilton/${{ matrix.image }}@${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "$IMAGE"
+
+      - name: Verify signature (strict identity)
+        env:
+          IMAGE: ghcr.io/lhilton/${{ matrix.image }}@${{ steps.build.outputs.digest }}
+        run: |
+          cosign verify "$IMAGE" \
+            --certificate-identity 'https://github.com/lhilton/mem0-container/.github/workflows/mem0-upstream-rebuild.yml@refs/heads/main' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+      - name: Verify SLSA provenance attestation (strict identity)
+        env:
+          IMAGE: ghcr.io/lhilton/${{ matrix.image }}@${{ steps.build.outputs.digest }}
+        run: |
+          cosign verify-attestation --type slsaprovenance "$IMAGE" \
+            --certificate-identity 'https://github.com/lhilton/mem0-container/.github/workflows/mem0-upstream-rebuild.yml@refs/heads/main' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+      - name: Install crane
+        if: ${{ needs.check.outputs.should_promote == 'true' }}
+        uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+        with:
+          version: v0.21.7
+
+      - name: Promote mutable tags
+        if: ${{ needs.check.outputs.should_promote == 'true' }}
+        env:
+          IMAGE_REPO: ghcr.io/lhilton/${{ matrix.image }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          UPSTREAM_TAG: ${{ needs.check.outputs.tag }}
+          CERTIFICATE_IDENTITY: https://github.com/lhilton/mem0-container/.github/workflows/mem0-upstream-rebuild.yml@refs/heads/main
+        run: |
+          set -euo pipefail
+
+          VERSION="${UPSTREAM_TAG#v}"
+          MAJOR="${VERSION%%.*}"
+          MINOR_PATCH="${VERSION#*.}"
+          MINOR="${MINOR_PATCH%%.*}"
+          PROMOTE_TAGS=("latest" "${MAJOR}.${MINOR}" "$MAJOR")
+
+          for tag in "${PROMOTE_TAGS[@]}"; do
+            ref="${IMAGE_REPO}:${tag}"
+            crane tag "${IMAGE_REPO}@${IMAGE_DIGEST}" "$tag"
+
+            promoted_digest=$(crane digest "$ref")
+            if [ "$promoted_digest" != "$IMAGE_DIGEST" ]; then
+              echo "::error::Promoted $ref points to $promoted_digest, expected $IMAGE_DIGEST"
+              exit 1
+            fi
+
+            cosign verify "$ref" \
+              --certificate-identity "$CERTIFICATE_IDENTITY" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com
+            cosign verify-attestation --type slsaprovenance "$ref" \
+              --certificate-identity "$CERTIFICATE_IDENTITY" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          done
+
+  # ---------------------------------------------------------------------------
+  # Job 3: commit the processed tag back to .upstream-release.
+  # Skipped for manual tag dispatches (preserves cron's no-op detection).
+  # ---------------------------------------------------------------------------
+  commit-pin:
+    needs: [check, build]
+    if: needs.check.outputs.changed == 'true' && needs.check.outputs.should_promote == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: true
+
+      - name: Commit and push .upstream-release
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          SHA: ${{ needs.check.outputs.sha }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          echo "$TAG" > .upstream-release
+          git add .upstream-release
+          if git diff --cached --quiet; then
+            echo "no change to commit"
+            exit 0
+          fi
+          git commit -m "chore(upstream): mem0 @ $TAG ($SHA)"
+          # Idempotent push: fetch first, then push (no rebase — fails loudly on conflict).
+          git fetch origin "$BRANCH"
+          git push origin HEAD:"$BRANCH"

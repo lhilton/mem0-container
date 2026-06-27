@@ -1,0 +1,35 @@
+# --- Secrets / local config ---
+.env
+.env.*
+!.env.example
+
+# --- Agent / tooling state (not shipped) ---
+.omo/
+.codegraph
+.context/
+
+# --- macOS ---
+.DS_Store
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# --- Node ---
+node_modules/
+.next/
+out/
+
+# --- Docker (local overrides) ---
+docker-compose.override.yaml
+
+# --- Editor ---
+.idea/
+.vscode/
+*.swp
